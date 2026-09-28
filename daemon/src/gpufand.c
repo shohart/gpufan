@@ -36,6 +36,7 @@ typedef struct {
     CurvePoint pts[MAX_POINTS];
     int npts;
     int fails;
+    int hot;            // index of the key that was hottest last time it was read
     double last;        // last good temperature
     double temp;        // temperature used this cycle (NAN on failure)
 } Source;
@@ -162,13 +163,19 @@ static void fankey(char out[5], int fan, const char *suffix) {
     out[0] = 'F'; out[1] = idx[fan & 15]; out[2] = suffix[0]; out[3] = suffix[1]; out[4] = 0;
 }
 
+// A source is the hottest of its keys; remember which one won so logs and status
+// name the sensor the curve actually followed, not just the first key listed.
 static int read_source(Source *s, double *temp) {
-    int ok = 0; double best = -1000;
+    int ok = 0, hot = 0; double best = -1000;
     for (int i = 0; i < s->nkeys; i++) {
         double v;
-        if (smc_read_num(s->keys[i], &v) == 0 && v > 0 && v < 150) { ok = 1; if (v > best) best = v; }
+        if (smc_read_num(s->keys[i], &v) == 0 && v > 0 && v < 150) {
+            ok = 1;
+            if (v > best) { best = v; hot = i; }
+        }
     }
     if (!ok) return -1;
+    s->hot = hot;
     *temp = best;
     return 0;
 }
@@ -228,8 +235,8 @@ static void write_status(const Config *c, double duty, int failed) {
         const Source *src = &c->src[s];
         fprintf(f, "%s{\"keys\":[", s ? "," : "");
         for (int k = 0; k < src->nkeys; k++) fprintf(f, "%s\"%s\"", k ? "," : "", src->keys[k]);
-        if (isnan(src->temp)) fprintf(f, "],\"temp\":null}");
-        else fprintf(f, "],\"temp\":%.1f}", src->temp);
+        if (isnan(src->temp)) fprintf(f, "],\"hot\":null,\"temp\":null}");
+        else fprintf(f, "],\"hot\":\"%s\",\"temp\":%.1f}", src->keys[src->hot], src->temp);
     }
     fprintf(f, "],\"fans\":[");
     for (int i = 0; i < c->nfans; i++) {
@@ -302,7 +309,7 @@ int main(int argc, char **argv) {
             if (du > up) up = du;
             if (dd > down) down = dd;
             if (dl < sizeof desc)
-                dl += snprintf(desc + dl, sizeof desc - dl, "%s%s=%.1f", s ? " " : "", src->keys[0], t);
+                dl += snprintf(desc + dl, sizeof desc - dl, "%s%s=%.1f", s ? " " : "", src->keys[src->hot], t);
         }
         up = clampd(up, cfg.min_duty, 100);
         down = clampd(down, cfg.min_duty, 100);
