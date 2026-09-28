@@ -1,0 +1,15 @@
+gpufan
+Copyright (c) 2026, shohart
+
+This product includes software developed as part of VirtualSMC
+(https://github.com/acidanthera/VirtualSMC):
+
+  kext/src/NuvotonDevice.hpp
+  kext/src/NuvotonDevice.cpp
+
+  Derived from SMCSuperIO, Copyright (c) 2018 vit9696, Copyright (c) 2018 joedm,
+  licensed under the BSD 3-Clause License. Fan control support is the only
+  addition; kext/nuvoton-fan-control.patch is the complete difference from
+  upstream VirtualSMC 1.3.8.
+
+The NCT679x register map follows the nct6775 driver of the Linux kernel.

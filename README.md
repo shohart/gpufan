@@ -134,7 +134,7 @@ PWM-канале, а тахометр заведён только с CPU_FAN: `g
 
 Кекст — форк [SMCSuperIO](https://github.com/acidanthera/VirtualSMC) из VirtualSMC
 (vit9696, joedm); изменён единственный файл, `NuvotonDevice`. Карта регистров NCT679x взята
-из драйвера `nct6775` ядра Linux.
+из драйвера `nct6775` ядра Linux. Подробности — в [`NOTICE`](NOTICE).
 
 ## English summary
 
@@ -147,4 +147,5 @@ channels and sensors, walks you through binding them and setting temperature thr
 installs a launchd service. Fan curves take the maximum across several sensor groups, so the
 fans spin up whether the CPU or the GPU is the one getting hot. Documentation is in Russian.
 
-Licensed BSD-3-Clause, matching upstream VirtualSMC.
+Licensed BSD-3-Clause, matching upstream VirtualSMC; see [`NOTICE`](NOTICE) for attribution
+of derived code.
