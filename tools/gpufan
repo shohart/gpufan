@@ -1,0 +1,499 @@
+#!/bin/zsh
+#
+# gpufan — управление вентиляторами материнской платы по датчикам температуры.
+# Аналог pwmconfig/fancontrol из lm-sensors, только под macOS и поверх SMC.
+#
+# Требует кекст SMCSuperIO с управлением вентиляторами (см. kext/). Запись в SMC
+# возможна только от root, поэтому команды, которые крутят вентиляторы или ставят
+# службу, запускаются через sudo. Чтение — без привилегий.
+#
+set -u
+emulate -L zsh
+setopt null_glob
+
+REPO=${0:A:h:h}
+BUILD=$REPO/build
+SMC=$BUILD/smc
+GPUFAND=$BUILD/gpufand
+
+CONF=/usr/local/etc/gpufand.conf
+BIN_SYS=/usr/local/sbin/gpufand
+PLIST_SRC=$REPO/daemon/com.shohart.gpufand.plist
+PLIST_SYS=/Library/LaunchDaemons/com.shohart.gpufand.plist
+SERVICE=system/com.shohart.gpufand
+STATUS_JSON=/var/run/gpufand.json
+LOGFILE=/var/log/gpufand.log
+
+if [ -t 1 ]; then BOLD=$'\033[1m'; DIM=$'\033[2m'; OFF=$'\033[0m'; else BOLD=""; DIM=""; OFF=""; fi
+b()   { printf '%s%s%s\n' "$BOLD" "$1" "$OFF" }
+bn()  { printf '%s%s%s'   "$BOLD" "$1" "$OFF" }
+dim() { printf '%s%s%s\n' "$DIM"  "$1" "$OFF" }
+die() { print -u2 "gpufan: $1"; exit 1 }
+
+need_root() { [ "$(id -u)" -eq 0 ] || die "нужен root: sudo ${0:t} $*" }
+
+build_smc() {
+  [ -x $SMC ] && [ $SMC -nt $REPO/tools/smc.c ] && return
+  mkdir -p $BUILD
+  cc -O2 -Wall -o $SMC $REPO/tools/smc.c -framework IOKit || die "не собрать tools/smc.c"
+}
+build_daemon() {
+  [ -x $GPUFAND ] && [ $GPUFAND -nt $REPO/daemon/src/gpufand.c ] && return
+  mkdir -p $BUILD
+  cc -O2 -Wall -Wextra -o $GPUFAND $REPO/daemon/src/gpufand.c -framework IOKit || die "не собрать daemon/src/gpufand.c"
+}
+
+val() { $SMC r "$1" 2>/dev/null | sed -n 's/.*value=\([0-9.-]*\).*/\1/p' }
+has() { $SMC i "$1" >/dev/null 2>&1 }
+int() { local v=${1:-}; print -- ${${v%%.*}:-0} }
+
+fan_name() {
+  local n
+  n=$($SMC r F${1}ID 2>/dev/null | sed -n 's/.*bytes=//p' | cut -d' ' -f5-16 | xxd -r -p 2>/dev/null | tr -d '\000')
+  print -- ${n:-F$1}
+}
+
+# ---------------------------------------------------------------- инвентарь
+
+typeset -ga CTRL_FANS TACH_FANS
+scan_fans() {
+  local f
+  CTRL_FANS=(); TACH_FANS=()
+  for f in 0 1 2 3 4 5 6 7; do
+    has F${f}Ac && TACH_FANS+=($f)
+    has F${f}Md && CTRL_FANS+=($f)
+  done
+  [ ${#TACH_FANS[@]} -gt 0 ] || die "SMC-ключей вентиляторов нет — кекст не загружен (проверь: gpufan doctor)"
+}
+
+mode_name() {
+  case $(int $(val F${1}Md)) in
+    0) print BIOS ;;
+    1) print RPM  ;;
+    2) print duty ;;
+    *) print "?"  ;;
+  esac
+}
+
+show_fans() {
+  local f md ctl pw
+  b "Каналы вентиляторов"
+  printf "  %-3s %-11s %8s %6s %6s  %s\n" "№" "разъём" "об/мин" "PWM" "режим" "управление"
+  for f in $TACH_FANS; do
+    md="—"; pw="—"; ctl="нет, только тахометр"
+    if (( ${CTRL_FANS[(I)$f]} )); then
+      md=$(mode_name $f); ctl="есть"
+      has F${f}Pw && pw=$(int $(val F${f}Pw))
+    fi
+    printf "  %-3s %-11s %8s %6s %6s  %s\n" "$f" "$(fan_name $f)" "$(int $(val F${f}Ac))" "$pw" "$md" "$ctl"
+  done
+}
+
+# Человеческие имена датчиков; для остальных — по префиксу ключа.
+typeset -gA SENSOR_NAME=(
+  TC0P "CPU, рядом с сокетом"  TC0D "CPU, кристалл"       TC0H "CPU, радиатор"
+  TG0D "GPU, кристалл"         TG0P "GPU, рядом с чипом"  TGDD "GPU, кристалл (Vega20)"
+  TA0P "воздух в корпусе"      TN0P "чипсет"              TM0P "память"
+  Th0H "тепловая трубка"
+)
+# Порядок «главных» датчиков: их показываем первыми, дубликаты сворачиваем в их пользу.
+typeset -ga SENSOR_PRIORITY=(TC0P TC0D TG0D TGDD TG0P TA0P TN0P TM0P Th0H)
+
+sensor_label() {
+  [[ -n ${SENSOR_NAME[$1]:-} ]] && { print -- "${SENSOR_NAME[$1]}"; return }
+  case $1 in
+    TC[0-9A-H]C|TC[0-9A-H]c) print -- "CPU, ядро ${1[3]}" ;;
+    TC*) print -- "CPU" ;;
+    TG*) print -- "GPU" ;;
+    *)   print -- "—"   ;;
+  esac
+}
+
+# Заполняет SENSOR_KEYS (индекс в списке -> ключ) и печатает таблицу.
+typeset -ga SENSOR_KEYS
+show_sensors() {
+  local all=${1:-0} k t sz attr v grp i
+  local -a rest
+  typeset -A VALUE shown covered
+  SENSOR_KEYS=()
+
+  while read -r k t sz attr v; do
+    [[ $t == sp78 && -n ${v:-} ]] || continue
+    (( ${v%%.*} > 0 && ${v%%.*} < 150 )) || continue
+    VALUE[$k]=${v%%.*}
+    rest+=($k)
+  done < <($SMC l T 2>/dev/null | tail -n +2)
+  [ ${#rest[@]} -gt 0 ] || die "не найдено ни одного датчика температуры"
+
+  # zsh забирает кавычки внутри индекса в имя ключа — индекс собираем отдельной переменной.
+  for k in $SENSOR_PRIORITY; do
+    [[ -n ${VALUE[$k]:-} ]] || continue
+    SENSOR_KEYS+=($k); shown[$k]=1
+    grp=${k[1,3]}_${VALUE[$k]}; covered[$grp]=1
+  done
+  for k in $rest; do
+    [[ -n ${shown[$k]:-} ]] && continue
+    if (( ! all )); then
+      grp=${k[1,3]}_${VALUE[$k]}
+      [[ -n ${covered[$grp]:-} ]] && continue
+      covered[$grp]=1
+    fi
+    SENSOR_KEYS+=($k)
+  done
+
+  b "Датчики температуры"
+  i=1
+  for k in $SENSOR_KEYS; do
+    printf "  %2d) %-5s %5s °C  %s\n" $i "$k" "${VALUE[$k]}" "$(sensor_label $k)"
+    (( i++ ))
+  done
+  (( all )) || { print ""; dim "  Дубликаты свёрнуты. Все ключи: gpufan sensors -a" }
+}
+
+service_state() {
+  local pid
+  launchctl print $SERVICE >/dev/null 2>&1 || { print "не установлена"; return }
+  pid=$(launchctl print $SERVICE 2>/dev/null | sed -n 's/.*pid = \([0-9]*\).*/\1/p' | head -1)
+  [[ -n $pid ]] && print "работает (pid $pid)" || print "загружена, но не запущена"
+}
+
+# ---------------------------------------------------------------- диагностика
+
+cmd_doctor() {
+  build_smc
+  local n
+  b "Кекст"
+  if kmutil showloaded --list-only 2>/dev/null | grep -qi SMCSuperIO; then
+    kmutil showloaded --list-only 2>/dev/null | grep -iE "Lilu|VirtualSMC|SMCSuperIO" | sed 's/^/  /'
+  else
+    print "  SMCSuperIO не загружен"
+  fi
+  ioreg -rc SMCSuperIO -d1 2>/dev/null | grep -E "ChipName|VersionInfo" | sed 's/^ *//;s/^/  /' \
+    || print "  сервис SMCSuperIO не найден в ioreg"
+  print ""
+
+  b "SMC"
+  n=$(val FNum)
+  if [[ -n $n ]]; then
+    print "  FNum = $(int $n) вентиляторов"
+    if has F0Md; then print "  управление: есть (ключи F<n>Md/Tg/Mn/Mx, FS! )"
+    else print "  управление: НЕТ — загружен апстримный SMCSuperIO без патча"; fi
+  else
+    print "  ключ FNum не читается"
+  fi
+  if [ "$(id -u)" -eq 0 ]; then print "  запись в SMC: доступна (root)"
+  else dim "  запись в SMC: недоступна без sudo — это нормально для чтения"; fi
+  print ""
+
+  b "Служба"
+  print "  состояние: $(service_state)"
+  if [ -f $CONF ]; then print "  конфиг: $CONF"; else print "  конфиг: нет ($CONF)"; fi
+  if [ -f $STATUS_JSON ]; then print "  статус: $(cat $STATUS_JSON)"; fi
+}
+
+cmd_status() {
+  build_smc; scan_fans
+  show_fans
+  print ""
+  dim "  Ноль оборотов при работающем управлении — обычное дело: на многих платах"
+  dim "  несколько разъёмов разведены на один канал чипа, а тахометр заведён с одного."
+  dim "  Что чем крутится, покажет: sudo gpufan scan"
+  print ""
+  show_sensors
+  print ""
+  bn "Служба gpufand: "; print "$(service_state)"
+  [ -f $CONF ] || dim "  не настроено — запусти: sudo gpufan setup"
+}
+
+cmd_sensors() {
+  build_smc
+  show_sensors $([[ ${1:-} == -a ]] && print 1 || print 0)
+}
+
+# ---------------------------------------------------------------- вентиляторы
+
+# Вернуть перечисленные каналы под управление BIOS.
+restore_fans() {
+  local f
+  for f in $@; do $SMC w F${f}Md 0 >/dev/null 2>&1; done
+}
+
+cmd_test() {
+  build_smc; need_root test "$@"
+  local f=${1:-} s=${2:-8}
+  [[ -n $f ]] || die "укажи номер канала: sudo gpufan test 1"
+  has F${f}Md || die "у канала $f нет управления (ключа F${f}Md)"
+
+  trap "restore_fans $f; print '\nF$f возвращён BIOS'" EXIT INT TERM
+  print "Канал $f ($(fan_name $f)). Обороты только вверх — снижать не будем."
+  printf "  BIOS:      %6s об/мин, PWM %s\n" "$(int $(val F${f}Ac))" "$(int $(val F${f}Pw))"
+  $SMC w F${f}Tg 100 >/dev/null && $SMC w F${f}Md 2 >/dev/null || die "запись не удалась"
+  sleep $s
+  printf "  duty 100%%: %6s об/мин, PWM %s   <- сейчас должно быть слышно\n" "$(int $(val F${f}Ac))" "$(int $(val F${f}Pw))"
+  $SMC w F${f}Md 0 >/dev/null
+  sleep $s
+  printf "  снова BIOS: %5s об/мин, PWM %s\n" "$(int $(val F${f}Ac))" "$(int $(val F${f}Pw))"
+  trap - EXIT INT TERM
+}
+
+cmd_scan() {
+  build_smc; need_root scan "$@"
+  scan_fans
+  local s=${1:-10} f t line
+  local -a targets
+  targets=($CTRL_FANS)
+
+  trap "restore_fans $targets; print '\nвсе каналы возвращены BIOS'" EXIT INT TERM
+  print "Прогон каждого канала по очереди: BIOS -> 100% -> 0% -> BIOS, по $s с на шаг."
+  print "Смотри, какой вентилятор меняет обороты на каком шаге — этого не видно по цифрам."
+  print ""
+  printf "  %-3s %-11s %14s %14s %14s\n" "№" "разъём" "BIOS об/PWM" "100% об/PWM" "0% об/PWM"
+  for f in $targets; do
+    line=$(printf "  %-3s %-11s %14s" "$f" "$(fan_name $f)" "$(int $(val F${f}Ac))/$(int $(val F${f}Pw))")
+    $SMC w F${f}Tg 100 >/dev/null && $SMC w F${f}Md 2 >/dev/null || { print "$line   запись не удалась"; continue }
+    sleep $s
+    line="$line$(printf ' %14s' "$(int $(val F${f}Ac))/$(int $(val F${f}Pw))")"
+    $SMC w F${f}Tg 0 >/dev/null
+    sleep $s
+    line="$line$(printf ' %14s' "$(int $(val F${f}Ac))/$(int $(val F${f}Pw))")"
+    $SMC w F${f}Md 0 >/dev/null
+    print "$line"
+    sleep 2
+  done
+  trap - EXIT INT TERM
+  restore_fans $targets
+  print ""
+  dim "  PWM меняется, обороты меняются  — канал управляет вентилятором с тахометром."
+  dim "  PWM меняется, обороты всегда 0  — вентилятор есть, но тахометр не разведён,"
+  dim "                                    либо к разъёму ничего не подключено."
+  dim "  Несколько разъёмов на одном канале — нормальная разводка дешёвых плат."
+}
+
+cmd_calibrate() {
+  build_smc; need_root calibrate "$@"
+  local f=${1:-} s=${2:-8} d rpm pwm maxrpm=0 minrpm=0 minduty=0
+  [[ -n $f ]] || die "укажи номер канала: sudo gpufan calibrate 1"
+  has F${f}Md || die "у канала $f нет управления (ключа F${f}Md)"
+
+  trap "restore_fans $f; print '\nF$f возвращён BIOS'" EXIT INT TERM
+  print "Замер оборотов по ступеням скважности на канале $f ($(fan_name $f))."
+  print "Службу лучше остановить: sudo gpufan stop"
+  print ""
+  printf "  %6s %9s %5s\n" duty "об/мин" PWM
+  for d in 100 80 60 50 40 30 25 20 15 10 5; do
+    $SMC w F${f}Tg $d >/dev/null && $SMC w F${f}Md 2 >/dev/null || die "запись не удалась"
+    sleep $s
+    rpm=$(int $(val F${f}Ac)); pwm=$(int $(val F${f}Pw))
+    printf "  %5d%% %9s %5s\n" $d $rpm $pwm
+    (( d == 100 )) && maxrpm=$rpm
+    (( rpm > 0 )) && { minrpm=$rpm; minduty=$d }
+  done
+  trap - EXIT INT TERM
+  restore_fans $f
+  print ""
+  if (( maxrpm > 0 )); then
+    print "Максимум ${maxrpm} об/мин; минимальные устойчивые ${minrpm} об/мин при ${minduty}%."
+    print "В мастере настройки задай минимальную скважность не ниже $(( minduty + 5 ))%."
+    print ""
+    dim "  Границы можно зафиксировать в config.plist (DeviceProperties на LPC):"
+    dim "    fan${f}-min = <$(printf '%02x%02x' $(( minrpm & 255 )) $(( minrpm >> 8 )))>   fan${f}-max = <$(printf '%02x%02x' $(( maxrpm & 255 )) $(( maxrpm >> 8 )))>"
+  else
+    print "Тахометр на этом канале не отвечает — обороты измерить нечем."
+    print "Скважностью канал всё равно управляется, для службы этого достаточно."
+  fi
+}
+
+# ---------------------------------------------------------------- настройка
+
+ask() {   # ask <переменная> <подсказка> <по умолчанию>
+  local __v=$1 __p=$2 __d=$3 __a
+  read "__a?$__p [$__d]: "
+  typeset -g $__v="${__a:-$__d}"
+}
+
+ask_int() {  # ask_int <переменная> <подсказка> <по умолчанию> <мин> <макс>
+  local __v=$1 __p=$2 __d=$3 __lo=$4 __hi=$5 __a
+  while true; do
+    read "__a?$__p [$__d]: "
+    : ${__a:=$__d}
+    [[ $__a == <-> ]] && (( __a >= __lo && __a <= __hi )) && { typeset -g $__v=$__a; return }
+    print "    нужно целое от $__lo до $__hi"
+  done
+}
+
+cmd_setup() {
+  need_root setup
+  build_smc; build_daemon; scan_fans
+  [ ${#CTRL_FANS[@]} -gt 0 ] || die "нет управляемых каналов — нужен кекст с патчем (gpufan doctor)"
+
+  local -a FANS SOURCES keys live
+  local f gi pick n k cur t tmin tmax def_fans yn tmpc
+
+  print ""
+  b "Настройка управления вентиляторами"
+  print "Одноразовая: привязываем каналы к датчикам, задаём пороги, ставим службу."
+  print ""
+  show_fans
+  print ""
+
+  b "Шаг 1 из 3. Какие каналы будет крутить служба?"
+  dim "  Номера через пробел. Нужен тот канал, который реально меняет обороты —"
+  dim "  проверить: sudo gpufan test <номер>, а весь расклад: sudo gpufan scan"
+  live=()
+  for f in $CTRL_FANS; do (( $(int $(val F${f}Ac)) > 0 )) && live+=($f); done
+  [ ${#live[@]} -gt 0 ] && def_fans="${live[*]}" || def_fans="${CTRL_FANS[*]}"
+  ask FANS_IN "  каналы" "$def_fans"
+  FANS=(${=FANS_IN})
+  [ ${#FANS[@]} -gt 0 ] || die "не выбрано ни одного канала"
+  for f in $FANS; do has F${f}Md || die "у канала $f нет ключа F${f}Md"; done
+  print ""
+
+  show_sensors
+  print ""
+  b "Шаг 2 из 3. Привязка к датчикам."
+  dim "  Групп может быть несколько. В группе один датчик или несколько — тогда"
+  dim "  берётся самый горячий из них. Итоговые обороты — максимум по всем группам:"
+  dim "  греется процессор или видеокарта, вентиляторы раскрутятся в любом случае."
+  print ""
+  gi=1
+  while true; do
+    read "pick?  Группа $gi — номера датчиков через пробел (Enter — закончить): "
+    [[ -z ${pick// /} ]] && break
+    keys=()
+    for n in ${=pick}; do
+      if [[ $n != <-> ]] || (( n < 1 || n > ${#SENSOR_KEYS[@]} )); then
+        print "    нет датчика с номером «$n» — группа пропущена"; keys=(); break
+      fi
+      keys+=(${SENSOR_KEYS[$n]})
+    done
+    [ ${#keys[@]} -eq 0 ] && continue
+    (( ${#keys[@]} > 4 )) && { print "    в группе не больше четырёх ключей — взяты первые четыре"; keys=(${keys[1,4]}) }
+    cur=0
+    for k in $keys; do t=$(int $(val $k)); (( t > cur )) && cur=$t; done
+    print "    выбрано: ${keys[*]} — сейчас $cur °C"
+    ask_int tmin "    ниже какой температуры держать минимальные обороты, °C" $(( cur + 5 )) 20 110
+    ask_int tmax "    при какой температуре выходить на максимум, °C" $(( tmin + 30 > 110 ? 110 : tmin + 30 )) $(( tmin + 1 )) 120
+    SOURCES+=("${(j:,:)keys} : ${tmin}:__MIN__ ${tmax}:100")
+    print ""
+    (( gi++ ))
+    (( gi > 4 )) && { print "  больше четырёх групп служба не примет"; break }
+  done
+  [ ${#SOURCES[@]} -gt 0 ] || die "не выбрано ни одного датчика"
+
+  b "Шаг 3 из 3. Пределы."
+  dim "  Минимальная скважность — сколько держать, когда всё холодное. Слишком мало,"
+  dim "  и вентилятор не тронется с места; для процессорного кулера ниже 30% рискованно."
+  dim "  Подобрать точно: sudo gpufan calibrate <канал>"
+  ask_int MIN_DUTY "  минимальная скважность, %" 30 0 100
+  ask_int INTERVAL "  период опроса датчиков, с" 2 1 10
+  ask_int HYST     "  гистерезис: на сколько остыть, прежде чем сбавлять, °C" 3 0 20
+  print ""
+
+  tmpc=$(mktemp -t gpufand.conf)
+  {
+    print "# Создано gpufan setup $(date '+%F %T')."
+    print "# Поправить и применить без перезапуска: sudo launchctl kill HUP $SERVICE"
+    print ""
+    print "fans = ${(j:,:)FANS}"
+    print ""
+    for k in $SOURCES; do print "source = ${k//__MIN__/$MIN_DUTY}"; done
+    print ""
+    print "interval   = $INTERVAL"
+    print "min_duty   = $MIN_DUTY"
+    print "fail_duty  = 100    # датчик перестал читаться — обороты на максимум"
+    print "fail_limit = 3"
+    print "down_step  = 2"
+    print "hysteresis = $HYST"
+  } > $tmpc
+
+  b "Конфигурация"
+  sed 's/^/  /' $tmpc
+  print ""
+  b "Проверка на текущих температурах"
+  $GPUFAND -c $tmpc --once 2>&1 | sed 's/^/  /' || { rm -f $tmpc; die "конфиг не проходит проверку" }
+  print ""
+
+  install -d -m 755 ${CONF:h}
+  install -m 644 $tmpc $CONF
+  rm -f $tmpc
+  print "Конфиг сохранён: $CONF"
+
+  read "yn?Включить службу и автозапуск? [Y/n]: "
+  [[ ${yn:l} == n* ]] && { print "Позже: sudo gpufan install"; return 0 }
+  cmd_install
+}
+
+# ---------------------------------------------------------------- служба
+
+cmd_install() {
+  need_root install
+  build_daemon
+  [ -f $CONF ] || die "нет конфига $CONF — сначала sudo gpufan setup"
+  $GPUFAND -c $CONF --once >/dev/null || die "конфиг $CONF не проходит проверку"
+
+  install -d -m 755 ${BIN_SYS:h}
+  install -m 755 $GPUFAND $BIN_SYS
+  install -m 644 -o root -g wheel $PLIST_SRC $PLIST_SYS
+  launchctl bootout $SERVICE 2>/dev/null
+  launchctl bootstrap system $PLIST_SYS || die "launchctl bootstrap не удался"
+  sleep 3
+  print "Служба: $(service_state)"
+  cmd_log 8
+}
+
+cmd_uninstall() {
+  need_root uninstall
+  launchctl bootout $SERVICE 2>/dev/null
+  rm -f $PLIST_SYS $BIN_SYS
+  print "Служба снята, вентиляторы возвращены BIOS. Конфиг $CONF оставлен."
+}
+
+cmd_start()   { need_root start;   launchctl bootstrap system $PLIST_SYS && print "запущена" }
+cmd_stop()    { need_root stop;    launchctl bootout $SERVICE 2>/dev/null; print "остановлена, вентиляторы возвращены BIOS" }
+cmd_restart() { need_root restart; launchctl bootout $SERVICE 2>/dev/null; sleep 1; launchctl bootstrap system $PLIST_SYS && print "перезапущена" }
+cmd_log()     { tail -n ${1:-30} $LOGFILE 2>/dev/null || print "журнала нет ($LOGFILE)" }
+
+# ---------------------------------------------------------------- разбор
+
+usage() {
+cat <<'TXT'
+gpufan — управление вентиляторами по датчикам температуры (pwmconfig для macOS)
+
+  gpufan                      каналы, датчики, состояние службы
+  gpufan doctor               что загружено и работает ли управление
+  gpufan sensors [-a]         датчики; -a — все ключи, без свёртки дубликатов
+  gpufan log [n]              последние строки журнала службы
+
+  sudo gpufan setup           мастер настройки и установка службы
+  sudo gpufan scan [сек]      прогон всех каналов: какой из них что крутит
+  sudo gpufan test <n> [сек]  один канал на слух, обороты только вверх
+  sudo gpufan calibrate <n>   обороты по ступеням скважности
+
+  sudo gpufan install         поставить и запустить службу по текущему конфигу
+  sudo gpufan start|stop|restart
+  sudo gpufan uninstall       снять службу (вентиляторы вернутся BIOS)
+
+Конфиг: /usr/local/etc/gpufand.conf — правится руками, применяется через
+  sudo launchctl kill HUP system/com.shohart.gpufand
+TXT
+}
+
+cmd=${1:-status}
+[ $# -gt 0 ] && shift
+case $cmd in
+  status)          cmd_status ;;
+  doctor)          cmd_doctor ;;
+  sensors)         cmd_sensors "$@" ;;
+  setup)           cmd_setup ;;
+  scan)            cmd_scan "$@" ;;
+  test)            cmd_test "$@" ;;
+  calibrate)       cmd_calibrate "$@" ;;
+  install)         cmd_install ;;
+  uninstall)       cmd_uninstall ;;
+  start)           cmd_start ;;
+  stop)            cmd_stop ;;
+  restart)         cmd_restart ;;
+  log)             cmd_log "$@" ;;
+  help|-h|--help)  usage ;;
+  *)               print -u2 "gpufan: неизвестная команда «$cmd»"; print ""; usage; exit 2 ;;
+esac
